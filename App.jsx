@@ -1,7 +1,41 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import usPhoto from './us.jpg'
+import { makeDailyReport, makeMonthlyReport } from './reports.js'
 
 const IMAGES = import.meta.glob('./*.png', { eager: true, import: 'default' })
 const pic = (name) => IMAGES[`./${name}.png`]
+
+const LOVE_NOTES = [
+  'Love is choosing the same person on ordinary Tuesdays, not just on special days.',
+  'Hold hands a little longer today. Small touches say big things.',
+  'The best conversations happen over chai, with nowhere else to be.',
+  'Be each other’s soft place to land after a long day.',
+  'Laughing at the same silly things is the sweetest glue two hearts can have.',
+  'Say thank you for the little things. They are never really little.',
+  'Some days one of you carries more. Love is taking turns without keeping score.',
+  'Look at each other the way you do in this photo. That spark is still right there.',
+  'Ask “how was your day, really?” and then listen to every word.',
+  'A hug that lasts twenty seconds can fix more than you think.',
+  'Growing together means cheering for each other’s dreams like they’re your own.',
+  'Forgive quickly, hug often, and never sleep with a heavy heart.',
+  'Home is wherever the two of you are being silly together.',
+  'Leave a sweet note somewhere unexpected. Tiny surprises keep love young.',
+  'Stay curious about each other forever. There is always more to discover.',
+  'On hard days, it’s the two of you against the problem, never against each other.',
+  'Plan a tiny adventure this week, even if it’s just a new street to walk down.',
+  'The way you speak to each other becomes the voice in each other’s heart. Keep it kind.',
+  'Celebrate the small wins together. Each one is a little love story.',
+  'Bade Baba and Chota Baba: two hearts, one team, endless cuddles.',
+  'Dance in the kitchen tonight. No music needed.',
+  'Say “I’m proud of you” out loud today. Hearts grow when they hear it.',
+  'Patience is love that’s willing to wait for the best in each other.',
+  'Make the kind of memories you’ll smile about when you’re old and still holding hands.',
+  'Every rupee you plan together is a little brick in the home you’re building.',
+  'Some months are tight. You two are tighter.',
+  'A late-night chai split two ways still counts as a date.',
+  'Saying “I spent a bit much” out loud is brave. Hearing it gently is love.',
+]
+const randomNote = () => LOVE_NOTES[Math.floor(Math.random() * LOVE_NOTES.length)]
 
 const STORAGE_KEY = 'spiko-budget-v1'
 
@@ -22,6 +56,12 @@ const rupee = new Intl.NumberFormat('en-IN', {
   maximumFractionDigits: 0,
 })
 const fmt = (n) => rupee.format(Math.round(n || 0))
+const fmtShort = (n) => {
+  if (n >= 100000) return `₹${(n / 100000).toFixed(1).replace(/\.0$/, '')}L`
+  if (n >= 1000) return `₹${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  return `₹${Math.round(n)}`
+}
+const newItem = (bucket) => ({ key: Math.random().toString(36).slice(2), amount: '', bucket, note: '' })
 
 const pad = (n) => String(n).padStart(2, '0')
 const toISO = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
@@ -56,14 +96,204 @@ function prettyDay(iso) {
   })
 }
 
+// ---------- Sync between phones ----------
+const PIN_KEY = 'bmm-pin'
+const QUEUE_KEY = 'bmm-queue'
+const MIGRATED_KEY = 'bmm-migrated'
+
+const store = {
+  get(k) {
+    try {
+      return localStorage.getItem(k)
+    } catch {
+      return null
+    }
+  },
+  set(k, v) {
+    try {
+      localStorage.setItem(k, v)
+    } catch {
+      /* ignore */
+    }
+  },
+  del(k) {
+    try {
+      localStorage.removeItem(k)
+    } catch {
+      /* ignore */
+    }
+  },
+}
+
+async function api(method, body, pin) {
+  let res
+  try {
+    res = await fetch('/api/data', {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(pin ? { 'x-pin': pin } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+  } catch {
+    throw Object.assign(new Error('offline'), { offline: true })
+  }
+  const type = res.headers.get('content-type') || ''
+  if (!type.includes('application/json')) throw Object.assign(new Error('no-api'), { noApi: true })
+  const json = await res.json()
+  if (res.status === 401 || res.status === 429) throw Object.assign(new Error(json.error), { badPin: true })
+  if (!res.ok) throw new Error(json.error || 'Something went wrong')
+  return json
+}
+
+function applyOp(d, op) {
+  if (op.action === 'save' || op.action === 'import') {
+    const expenses = [...d.expenses]
+    op.expenses.forEach((exp) => {
+      const i = expenses.findIndex((e) => e.id === exp.id)
+      if (i >= 0) expenses[i] = exp
+      else expenses.push(exp)
+    })
+    return { ...d, expenses }
+  }
+  if (op.action === 'delete') return { ...d, expenses: d.expenses.filter((e) => e.id !== op.id) }
+  if (op.action === 'limits') return { ...d, limits: op.limits }
+  return d
+}
+
+const loadQueue = () => {
+  try {
+    return JSON.parse(store.get(QUEUE_KEY) || '[]')
+  } catch {
+    return []
+  }
+}
+
 export default function App() {
   const [data, setData] = useState(loadData)
+  // 'checking' | 'local' | 'setup' | 'locked' | 'synced'
+  const [syncMode, setSyncMode] = useState('checking')
+  const [pinError, setPinError] = useState('')
+  const [pending, setPending] = useState(() => loadQueue().length)
+  const pinRef = useRef(store.get(PIN_KEY))
+  const queueRef = useRef(loadQueue())
+  const flushing = useRef(false)
+
+  function saveQueue() {
+    store.set(QUEUE_KEY, JSON.stringify(queueRef.current))
+    setPending(queueRef.current.length)
+  }
+
+  async function flush() {
+    if (flushing.current) return
+    flushing.current = true
+    try {
+      while (queueRef.current.length) {
+        await api('POST', queueRef.current[0], pinRef.current)
+        queueRef.current = queueRef.current.slice(1)
+        saveQueue()
+      }
+    } catch (e) {
+      if (e.badPin) {
+        store.del(PIN_KEY)
+        pinRef.current = null
+        setSyncMode('locked')
+      }
+    } finally {
+      flushing.current = false
+    }
+  }
+
+  async function refresh() {
+    if (!pinRef.current) return
+    try {
+      const remote = await api('GET', null, pinRef.current)
+      if (remote.needsSetup) return setSyncMode('setup')
+      setData((d) =>
+        queueRef.current.reduce(applyOp, {
+          limits: { ...d.limits, ...(remote.limits || {}) },
+          expenses: remote.expenses,
+        })
+      )
+      setSyncMode('synced')
+      flush()
+    } catch (e) {
+      if (e.badPin) {
+        store.del(PIN_KEY)
+        pinRef.current = null
+        setSyncMode('locked')
+      } else if (e.noApi) setSyncMode('local')
+      else setSyncMode('synced') // offline: keep showing this phone's copy
+    }
+  }
+
+  // First check: is the shared database there, and does this phone know the PIN?
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const res = await api('GET', null, pinRef.current)
+        if (res.needsSetup) return setSyncMode('setup')
+        await refresh()
+      } catch (e) {
+        if (e.badPin) setSyncMode('locked')
+        else if (e.noApi) setSyncMode('local')
+        else setSyncMode(pinRef.current ? 'synced' : 'local')
+      }
+    })()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pick up the other phone's changes
+  useEffect(() => {
+    if (syncMode !== 'synced') return
+    const tick = () => document.visibilityState === 'visible' && refresh()
+    const id = setInterval(tick, 20000)
+    document.addEventListener('visibilitychange', tick)
+    window.addEventListener('online', tick)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', tick)
+      window.removeEventListener('online', tick)
+    }
+  }, [syncMode]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  function commit(op) {
+    setData((d) => applyOp(d, op))
+    if (syncMode === 'synced') {
+      queueRef.current = [...queueRef.current, op]
+      saveQueue()
+      flush()
+    }
+  }
+
+  async function unlock(pin, isSetup) {
+    setPinError('')
+    try {
+      if (isSetup) await api('POST', { action: 'setup', pin })
+      await api('GET', null, pin)
+      pinRef.current = pin
+      store.set(PIN_KEY, pin)
+      // First time on this phone: send up whatever was saved here before syncing existed
+      if (!store.get(MIGRATED_KEY)) {
+        if (data.expenses.length) {
+          queueRef.current = [
+            { action: 'import', expenses: data.expenses, limits: data.limits },
+            ...queueRef.current,
+          ]
+          saveQueue()
+        }
+        store.set(MIGRATED_KEY, '1')
+      }
+      await flush()
+      await refresh()
+    } catch (e) {
+      setPinError(e.badPin ? e.message || 'That PIN didn’t match. Try again.' : e.message)
+    }
+  }
   const [viewMonth, setViewMonth] = useState(() => {
     const d = new Date()
     return new Date(d.getFullYear(), d.getMonth(), 1)
   })
   const [sheet, setSheet] = useState(null) // null | {mode:'add'} | {mode:'edit', expense} | {mode:'limits'}
   const [filter, setFilter] = useState('all')
+  const [selectedDay, setSelectedDay] = useState(null)
   const [celebrate, setCelebrate] = useState(null)
   const celebrateTimer = useRef(null)
 
@@ -121,40 +351,46 @@ export default function App() {
     cheer: celebrate,
   }[mood]
 
-  function saveExpense(exp) {
-    setData((d) => {
-      const exists = d.expenses.some((e) => e.id === exp.id)
-      return {
-        ...d,
-        expenses: exists ? d.expenses.map((e) => (e.id === exp.id ? exp : e)) : [...d.expenses, exp],
-      }
-    })
+  function saveExpenses(list) {
+    commit({ action: 'save', expenses: list })
     setSheet(null)
-    const bucket = BUCKETS.find((b) => b.id === exp.bucket)
-    setCelebrate(`Saved ${fmt(exp.amount)} to ${bucket.label}.`)
+    const total = list.reduce((a, e) => a + Number(e.amount), 0)
+    const msg =
+      list.length === 1
+        ? `Saved ${fmt(total)} to ${BUCKETS.find((b) => b.id === list[0].bucket).label}.`
+        : `Saved ${list.length} items, ${fmt(total)} in all.`
+    setCelebrate(msg)
     clearTimeout(celebrateTimer.current)
     celebrateTimer.current = setTimeout(() => setCelebrate(null), 2600)
   }
 
   function deleteExpense(id) {
-    setData((d) => ({ ...d, expenses: d.expenses.filter((e) => e.id !== id) }))
+    commit({ action: 'delete', id })
     setSheet(null)
   }
 
   function saveLimits(limits) {
-    setData((d) => ({ ...d, limits }))
+    commit({ action: 'limits', limits })
     setSheet(null)
   }
 
   function shiftMonth(delta) {
     setViewMonth((m) => new Date(m.getFullYear(), m.getMonth() + delta, 1))
+    setSelectedDay(null)
   }
 
-  const listed = filter === 'all' ? monthExpenses : monthExpenses.filter((e) => e.bucket === filter)
+  const listed = monthExpenses.filter(
+    (e) => (filter === 'all' || e.bucket === filter) && (!selectedDay || e.date === selectedDay)
+  )
+  const bucketLabel = filter === 'all' ? '' : BUCKETS.find((b) => b.id === filter).label + ' '
   const grouped = listed.reduce((acc, e) => {
     ;(acc[e.date] = acc[e.date] || []).push(e)
     return acc
   }, {})
+
+  if (syncMode === 'setup' || syncMode === 'locked') {
+    return <PinScreen setup={syncMode === 'setup'} error={pinError} onSubmit={unlock} />
+  }
 
   return (
     <div className="app">
@@ -163,6 +399,12 @@ export default function App() {
         Baba’s Money Manager
         <img src={pic('leaf')} alt="" aria-hidden="true" className="brand-leaf right" />
       </h1>
+      <UsCard />
+      {syncMode === 'synced' && (
+        <p className={`sync-pill ${pending ? 'waiting' : ''}`}>
+          {pending ? `${pending} change${pending > 1 ? 's' : ''} waiting to sync` : 'Shared between your phones'}
+        </p>
+      )}
       <header className="hero">
         <div className="month-switch">
           <button className="icon-btn" onClick={() => shiftMonth(-1)} aria-label="Previous month">
@@ -246,14 +488,41 @@ export default function App() {
         totalSpent={totalSpent}
       />
 
+      <Calendar
+        viewMonth={viewMonth}
+        monthExpenses={monthExpenses}
+        selectedDay={selectedDay}
+        onSelect={(iso) => setSelectedDay(selectedDay === iso ? null : iso)}
+      />
+
+      <Reports
+        day={selectedDay || (isCurrentMonth ? todayISO() : null)}
+        viewMonth={viewMonth}
+        expenses={data.expenses}
+        limits={data.limits}
+      />
+
       <section className="list-section">
-        <h2>
-          {filter === 'all' ? 'Expenses' : `${BUCKETS.find((b) => b.id === filter).label} expenses`}
-        </h2>
+        <div className="list-head">
+          <h2>
+            {selectedDay
+              ? `${bucketLabel}${prettyDay(selectedDay)}`
+              : `${bucketLabel}${bucketLabel ? 'expenses' : 'Expenses'}`}
+          </h2>
+          {selectedDay && (
+            <button className="link-btn" onClick={() => setSelectedDay(null)}>
+              Show whole month
+            </button>
+          )}
+        </div>
         {listed.length === 0 ? (
           <div className="empty">
             <img src={pic('cozy')} alt="" />
-            <p>Nothing here yet. Tap “Add expense” to log your first one.</p>
+            <p>
+              {selectedDay
+                ? 'Nothing spent on this day. Tap “Add expense” to add items for it.'
+                : 'Nothing here yet. Tap “Add expense” to log your first one.'}
+            </p>
           </div>
         ) : (
           Object.entries(grouped).map(([day, items]) => (
@@ -288,11 +557,19 @@ export default function App() {
         <span aria-hidden="true">+</span> Add expense
       </button>
 
-      {sheet && (sheet.mode === 'add' || sheet.mode === 'edit') && (
+      {sheet && sheet.mode === 'add' && (
+        <AddItemsSheet
+          defaultBucket={filter === 'all' ? 'home' : filter}
+          defaultDate={selectedDay || todayISO()}
+          onSave={saveExpenses}
+          onClose={() => setSheet(null)}
+        />
+      )}
+      {sheet && sheet.mode === 'edit' && (
         <ExpenseSheet
           initial={sheet.expense}
-          defaultBucket={filter === 'all' ? 'home' : filter}
-          onSave={saveExpense}
+          defaultBucket={sheet.expense.bucket}
+          onSave={(exp) => saveExpenses([exp])}
           onDelete={deleteExpense}
           onClose={() => setSheet(null)}
         />
@@ -310,20 +587,6 @@ function Insights({ monthExpenses, spent, limits, daysLeft, dayOfMonth, isCurren
   const dailyAvg = totalSpent / Math.max(dayOfMonth, 1)
   const biggest = monthExpenses.reduce((a, e) => (Number(e.amount) > Number(a.amount) ? e : a))
   const bigBucket = BUCKETS.find((b) => b.id === biggest.bucket)
-
-  // last 7 days
-  const days = []
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date()
-    d.setDate(d.getDate() - i)
-    const iso = toISO(d)
-    days.push({
-      iso,
-      label: d.toLocaleDateString('en-IN', { weekday: 'narrow' }),
-      total: monthExpenses.filter((e) => e.date === iso).reduce((a, e) => a + Number(e.amount), 0),
-    })
-  }
-  const maxDay = Math.max(...days.map((d) => d.total), 1)
 
   return (
     <section className="insights">
@@ -359,18 +622,6 @@ function Insights({ monthExpenses, spent, limits, daysLeft, dayOfMonth, isCurren
         </p>
       </div>
 
-      {isCurrentMonth && (
-        <div className="week" aria-label="Spending over the last seven days">
-          {days.map((d) => (
-            <div className="week-col" key={d.iso}>
-              <div className="week-bar-wrap">
-                <div className="week-bar" style={{ height: `${(d.total / maxDay) * 100}%` }} />
-              </div>
-              <span className="week-label">{d.label}</span>
-            </div>
-          ))}
-        </div>
-      )}
     </section>
   )
 }
@@ -391,7 +642,7 @@ function Sheet({ title, peek, onClose, children }) {
             ×
           </button>
         </div>
-        {children}
+        <div className="sheet-body">{children}</div>
       </div>
     </div>
   )
@@ -523,5 +774,371 @@ function Burst() {
         />
       ))}
     </div>
+  )
+}
+
+function Calendar({ viewMonth, monthExpenses, selectedDay, onSelect }) {
+  const y = viewMonth.getFullYear()
+  const m = viewMonth.getMonth()
+  const days = new Date(y, m + 1, 0).getDate()
+  const lead = new Date(y, m, 1).getDay()
+  const today = todayISO()
+
+  const totals = {}
+  monthExpenses.forEach((e) => (totals[e.date] = (totals[e.date] || 0) + Number(e.amount)))
+  const max = Math.max(...Object.values(totals), 1)
+
+  const cells = []
+  for (let i = 0; i < lead; i++) cells.push(<span key={`b${i}`} />)
+  for (let d = 1; d <= days; d++) {
+    const iso = `${y}-${pad(m + 1)}-${pad(d)}`
+    const total = totals[iso] || 0
+    const future = iso > today
+    cells.push(
+      <button
+        key={iso}
+        className={`cal-day ${iso === today ? 'today' : ''} ${selectedDay === iso ? 'on' : ''} ${total ? 'has' : ''}`}
+        style={{ '--i': total ? 0.25 + 0.75 * (total / max) : 0 }}
+        disabled={future}
+        onClick={() => onSelect(iso)}
+        aria-label={`${prettyDay(iso)}, ${total ? fmt(total) + ' spent' : 'nothing spent'}`}
+        aria-pressed={selectedDay === iso}
+      >
+        <span className="cal-num">{d}</span>
+        <span className="cal-amt">{total ? fmtShort(total) : ''}</span>
+      </button>
+    )
+  }
+
+  return (
+    <section className="calendar">
+      <h2>Daily tracker</h2>
+      <div className="cal-card">
+        <div className="cal-grid cal-week">
+          {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((w, i) => (
+            <span key={i}>{w}</span>
+          ))}
+        </div>
+        <div className="cal-grid">{cells}</div>
+        <p className="cal-tip">Tap a day to see what was spent and add items to it.</p>
+      </div>
+    </section>
+  )
+}
+
+function AddItemsSheet({ defaultBucket, defaultDate, onSave, onClose }) {
+  const [date, setDate] = useState(defaultDate)
+  const [items, setItems] = useState(() => [newItem(defaultBucket)])
+  const [focusKey, setFocusKey] = useState(null)
+  const refs = useRef({})
+
+  useEffect(() => {
+    const k = focusKey || items[0].key
+    refs.current[k]?.focus()
+  }, [focusKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const update = (key, patch) => setItems((list) => list.map((it) => (it.key === key ? { ...it, ...patch } : it)))
+  const addRow = () => {
+    const it = newItem(items[items.length - 1].bucket)
+    setItems((list) => [...list, it])
+    setFocusKey(it.key)
+  }
+  const removeRow = (key) => setItems((list) => list.filter((it) => it.key !== key))
+
+  const valid = items.filter((it) => Number(it.amount) > 0)
+  const total = valid.reduce((a, it) => a + Number(it.amount), 0)
+
+  function submit() {
+    if (!valid.length) return
+    const now = Date.now()
+    onSave(
+      valid.map((it, i) => ({
+        id: crypto.randomUUID(),
+        createdAt: now + i,
+        amount: Number(it.amount),
+        bucket: it.bucket,
+        note: it.note.trim(),
+        date,
+      }))
+    )
+  }
+
+  return (
+    <Sheet title="Add expenses" peek="wink" onClose={onClose}>
+      <label className="date-row">
+        <span>Date</span>
+        <input className="text-field" type="date" value={date} max={todayISO()} onChange={(e) => setDate(e.target.value)} />
+      </label>
+
+      {items.map((it) => (
+        <div className="item-card" key={it.key}>
+          <div className="item-top">
+            <label className="amount-field small">
+              <span className="rupee">₹</span>
+              <input
+                ref={(el) => (refs.current[it.key] = el)}
+                inputMode="decimal"
+                type="number"
+                min="0"
+                placeholder="0"
+                value={it.amount}
+                onChange={(e) => update(it.key, { amount: e.target.value })}
+                aria-label="Amount in rupees"
+              />
+            </label>
+            {items.length > 1 && (
+              <button className="icon-btn remove" onClick={() => removeRow(it.key)} aria-label="Remove this item">
+                ×
+              </button>
+            )}
+          </div>
+          <div className="chips" role="radiogroup" aria-label="Who is this for">
+            {BUCKETS.map((b) => (
+              <button
+                key={b.id}
+                role="radio"
+                aria-checked={it.bucket === b.id}
+                className={`chip ${it.bucket === b.id ? 'on' : ''}`}
+                style={{ '--c': b.color, '--soft': b.soft }}
+                onClick={() => update(it.key, { bucket: b.id })}
+              >
+                {b.label}
+              </button>
+            ))}
+          </div>
+          <input
+            className="text-field"
+            placeholder="What was it for? (optional)"
+            value={it.note}
+            onChange={(e) => update(it.key, { note: e.target.value })}
+            onKeyDown={(e) => e.key === 'Enter' && addRow()}
+          />
+        </div>
+      ))}
+
+      <button className="add-row" onClick={addRow}>
+        + Add another item
+      </button>
+
+      <button className="primary" disabled={!valid.length} onClick={submit}>
+        {valid.length > 1 ? `Save ${valid.length} items (${fmt(total)})` : valid.length ? `Save ${fmt(total)}` : 'Add an amount to save'}
+      </button>
+    </Sheet>
+  )
+}
+
+function PinScreen({ setup, error, onSubmit }) {
+  const [pin, setPin] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [busy, setBusy] = useState(false)
+  const clean = (v) => v.replace(/\D/g, '').slice(0, 8)
+  const ok = pin.length >= 4 && (!setup || pin === confirm)
+
+  async function go() {
+    if (!ok || busy) return
+    setBusy(true)
+    await onSubmit(pin, setup)
+    setBusy(false)
+  }
+
+  return (
+    <div className="app pin-screen">
+      <img className="pin-spiko" src={pic(setup ? 'love' : 'happy')} alt="" aria-hidden="true" />
+      <h1 className="pin-title">{setup ? 'Create a family PIN' : 'Enter your family PIN'}</h1>
+      <p className="pin-sub">
+        {setup
+          ? 'Pick 4 to 8 digits. You’ll use this PIN once on each phone, and then both phones share the same expenses.'
+          : 'Enter the same PIN you use on your other phone.'}
+      </p>
+      <input
+        className="pin-input"
+        type="password"
+        inputMode="numeric"
+        autoComplete="off"
+        placeholder="PIN"
+        value={pin}
+        onChange={(e) => setPin(clean(e.target.value))}
+        onKeyDown={(e) => e.key === 'Enter' && go()}
+        autoFocus
+      />
+      {setup && (
+        <input
+          className="pin-input"
+          type="password"
+          inputMode="numeric"
+          autoComplete="off"
+          placeholder="Same PIN again"
+          value={confirm}
+          onChange={(e) => setConfirm(clean(e.target.value))}
+          onKeyDown={(e) => e.key === 'Enter' && go()}
+        />
+      )}
+      {error && <p className="pin-error">{error}</p>}
+      <button className="primary" disabled={!ok || busy} onClick={go}>
+        {busy ? 'One moment' : setup ? 'Create PIN' : 'Open'}
+      </button>
+    </div>
+  )
+}
+
+const DANCE_MOVES = [
+  { img: 'music', move: 'dance', fx: '♪' },
+  { img: 'love', move: 'beat', fx: '♥' },
+  { img: 'joyful', move: 'sway', fx: '✦' },
+  { img: 'laugh', move: 'rock', fx: '♥' },
+  { img: 'cheer', move: 'float', fx: '✦' },
+  { img: 'wink', move: 'sway', fx: '♥' },
+]
+
+// The strolling Spiko's little routine: walk, stop and do something sweet, walk on
+const STROLL = [
+  { at: 0.5, walk: true, ms: 9000 },
+  { at: 0.5, pose: 'cheer', act: 'dance', ms: 7000 },
+  { at: 0, walk: true, ms: 9000 },
+  { at: 0, pose: 'wink', act: 'rest', ms: 6000 },
+  { at: 1, walk: true, ms: 16000 },
+  { at: 1, pose: 'love', act: 'hug', ms: 7000 },
+]
+
+function Stroller() {
+  const [i, setI] = useState(STROLL.length - 1)
+  const [from, setFrom] = useState(1)
+  const phase = STROLL[i]
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setFrom(phase.at)
+      setI((n) => (n + 1) % STROLL.length)
+    }, phase.ms)
+    return () => clearTimeout(t)
+  }, [i]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const facingRight = phase.walk && phase.at > from
+  return (
+    <div className="stroll" aria-hidden="true">
+      <div
+        className="walker"
+        style={{
+          left: `calc((100% - 56px) * ${phase.at})`,
+          transitionDuration: phase.walk ? `${phase.ms}ms` : '0ms',
+        }}
+      >
+        {phase.walk ? (
+          <div className="walker-step" key={`w${i}`} style={{ transform: facingRight ? 'scaleX(-1)' : 'none' }}>
+            <img src={pic('side')} alt="" />
+            <span className="trail">♥</span>
+          </div>
+        ) : (
+          <div className={`walker-pose act-${phase.act}`} key={`p${i}`}>
+            <img src={pic(phase.pose)} alt="" />
+            {phase.act === 'dance' && <span className="pose-fx">♪</span>}
+            {phase.act === 'rest' && <span className="pose-fx">z</span>}
+            {phase.act === 'hug' && <span className="pose-fx heart">♥</span>}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function UsCard() {
+  const [idx, setIdx] = useState(() => Math.floor(Math.random() * LOVE_NOTES.length))
+  const [step, setStep] = useState(0)
+
+  useEffect(() => {
+    const a = setInterval(() => setIdx((i) => (i + 1) % LOVE_NOTES.length), 12000)
+    const b = setInterval(() => setStep((s) => s + 1), 9000)
+    return () => {
+      clearInterval(a)
+      clearInterval(b)
+    }
+  }, [])
+
+  const move = DANCE_MOVES[step % DANCE_MOVES.length]
+
+  return (
+    <section className="us-card" aria-label="Us">
+      <div className="float-hearts" aria-hidden="true">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <span key={i} style={{ '--x': `${10 + i * 15}%`, '--d': `${i * 2}s`, '--s': `${0.7 + (i % 3) * 0.25}` }}>
+            ♥
+          </span>
+        ))}
+      </div>
+      <div className="us-row">
+        <figure className="polaroid">
+          <img src={usPhoto} alt="Bade Baba and Chota Baba together" />
+          <figcaption>Bade Baba &amp; Chota Baba</figcaption>
+        </figure>
+        <button className="dancer" onClick={() => setStep((s) => s + 1)} aria-label="Make Spiko do a new move">
+          <span className={`notes fx-${move.move}`} key={`fx${step}`} aria-hidden="true">
+            <i>{move.fx}</i>
+            <i>{move.fx}</i>
+            <i>{move.fx}</i>
+          </span>
+          <img key={step} className={`move-${move.move}`} src={pic(move.img)} alt="" />
+        </button>
+      </div>
+      <button className="love-note" key={idx} onClick={() => setIdx((i) => (i + 1) % LOVE_NOTES.length)}>
+        <span className="love-heart" aria-hidden="true">♥</span>
+        {LOVE_NOTES[idx]}
+      </button>
+      <Stroller />
+    </section>
+  )
+}
+
+function Reports({ day, viewMonth, expenses, limits }) {
+  const [busy, setBusy] = useState(null)
+  const [msg, setMsg] = useState('')
+  const pics = {
+    us: usPhoto,
+    hero: pic('hero'),
+    love: pic('love'),
+    cozy: pic('cozy'),
+    home: pic('hoodie'),
+    eshan: pic('beanie'),
+    niharika: pic('music'),
+  }
+
+  async function run(kind) {
+    setBusy(kind)
+    setMsg('')
+    try {
+      const args = { expenses, limits, buckets: BUCKETS, pics, note: randomNote() }
+      const result =
+        kind === 'daily'
+          ? await makeDailyReport({ ...args, day })
+          : await makeMonthlyReport({ ...args, month: viewMonth })
+      if (result !== 'cancelled') setMsg(result === 'shared' ? 'Report ready to save.' : 'Report downloaded.')
+    } catch {
+      setMsg('Couldn’t make the report this time. Please try again.')
+    }
+    setBusy(null)
+    setTimeout(() => setMsg(''), 3500)
+  }
+
+  const monthName = viewMonth.toLocaleDateString('en-IN', { month: 'long' })
+
+  return (
+    <section className="reports">
+      <h2 className="with-pic">
+        <img src={pic('joyful')} alt="" aria-hidden="true" />
+        Reports
+      </h2>
+      <div className="report-grid">
+        <button className="report-btn daily" disabled={!day || !!busy} onClick={() => run('daily')}>
+          <img className="report-pic" src={pic('reading')} alt="" aria-hidden="true" />
+          <span className="report-title">{busy === 'daily' ? 'Making it' : 'Daily report'}</span>
+          <span className="report-sub">{day ? prettyDay(day) : 'Pick a day on the calendar'}</span>
+        </button>
+        <button className="report-btn monthly" disabled={!!busy} onClick={() => run('monthly')}>
+          <img className="report-pic" src={pic('explorer')} alt="" aria-hidden="true" />
+          <span className="report-title">{busy === 'monthly' ? 'Making it' : 'Monthly report'}</span>
+          <span className="report-sub">{monthName}, with insights</span>
+        </button>
+      </div>
+      <p className="report-tip">{msg || 'Saves a picture to your phone, handy as a backup.'}</p>
+    </section>
   )
 }
