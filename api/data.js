@@ -55,7 +55,7 @@ export default async function handler(req, res) {
     if (hash(String(req.headers['x-pin'] || '')) !== storedPin) {
       await redis('INCR', P + 'fails')
       await redis('EXPIRE', P + 'fails', 900)
-      return res.status(401).json({ error: 'That PIN didn’t match. Try again.' })
+      return res.status(401).json({ error: "That PIN did not match. Try again." })
     }
 
     if (req.method === 'GET') {
@@ -65,4 +65,31 @@ export default async function handler(req, res) {
         try {
           expenses.push(JSON.parse(all[i]))
         } catch {
-          /*
+          /* skip bad row */
+        }
+      }
+      return res.json({ limits: limits ? JSON.parse(limits) : null, expenses })
+    }
+
+    if (req.method === 'POST') {
+      if (body.action === 'save' || body.action === 'import') {
+        const list = (body.expenses || []).filter(validExpense).map(cleanExpense)
+        if (list.length) await redis('HSET', P + 'expenses', ...list.flatMap((e) => [e.id, JSON.stringify(e)]))
+        if (body.action === 'import' && body.limits)
+          await redis('SET', P + 'limits', JSON.stringify(cleanLimits(body.limits)), 'NX')
+        return res.json({ ok: true })
+      }
+      if (body.action === 'delete') {
+        await redis('HDEL', P + 'expenses', String(body.id))
+        return res.json({ ok: true })
+      }
+      if (body.action === 'limits') {
+        await redis('SET', P + 'limits', JSON.stringify(cleanLimits(body.limits)))
+        return res.json({ ok: true })
+      }
+    }
+    return res.status(400).json({ error: 'Unknown request' })
+  } catch (e) {
+    return res.status(500).json({ error: e.message })
+  }
+}
