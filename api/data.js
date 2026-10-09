@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 const DB_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL
 const DB_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN
 const P = 'bmm:'
-const BUCKETS = ['home', 'eshan', 'niharika']
+const BUCKETS = ['home', 'eshan', 'niharika', 'vacation', 'extra']
 
 const hash = (pin) => createHash('sha256').update(`babas-money-manager:${pin}`).digest('hex')
 
