@@ -769,3 +769,20 @@ input[type=number] { -moz-appearance: textfield; }
   filter: drop-shadow(0 4px 4px rgba(107,75,62,.15));
 }
 .report-btn.monthly .report-pic { animation-delay: -2.2s; }
+
+/* Yearly budgets */
+.buckets.yearly { margin-top: 6px; }
+.buckets.yearly h2 { margin: 18px 4px 0; }
+.bucket-month {
+  justify-self: start;
+  margin-top: 2px;
+  padding: 2px 12px;
+  border-radius: 99px;
+  background: var(--soft);
+  color: var(--c);
+  font-weight: 700;
+  font-size: .95rem;
+}
+.bucket.active .bucket-month { background: rgba(255,255,255,.7); }
+.chips { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.limit-input input { width: 150px; }

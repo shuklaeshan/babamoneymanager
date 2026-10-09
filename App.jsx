@@ -43,10 +43,15 @@ const BUCKETS = [
   { id: 'home', label: 'Home', hint: 'Household', color: '#2E7D32', soft: '#DCEBD9', pic: 'hoodie' },
   { id: 'eshan', label: 'Bade Baba', hint: 'Pocket money', color: '#6B4B3E', soft: '#EADBCF', pic: 'beanie' },
   { id: 'niharika', label: 'Chota Baba', hint: 'Pocket money', color: '#C27A8C', soft: '#F3DDE2', pic: 'music' },
+  { id: 'vacation', label: 'Vacation', hint: 'Trips together', color: '#3A7CA5', soft: '#DCEAF3', pic: 'explorer', yearly: true },
+  { id: 'extra', label: 'Extras', hint: 'One-time buys', color: '#B7791F', soft: '#F6E7CC', pic: 'cozy', yearly: true },
 ]
+const MONTHLY = BUCKETS.filter((b) => !b.yearly)
+const YEARLY = BUCKETS.filter((b) => b.yearly)
+const emptyTotals = () => Object.fromEntries(BUCKETS.map((b) => [b.id, 0]))
 
 const DEFAULT_DATA = {
-  limits: { home: 50000, eshan: 20000, niharika: 20000 },
+  limits: { home: 50000, eshan: 20000, niharika: 20000, vacation: 200000, extra: 100000 },
   expenses: [],
 }
 
@@ -317,13 +322,25 @@ export default function App() {
   )
 
   const spent = useMemo(() => {
-    const s = { home: 0, eshan: 0, niharika: 0 }
-    monthExpenses.forEach((e) => (s[e.bucket] += Number(e.amount)))
+    const s = emptyTotals()
+    monthExpenses.forEach((e) => {
+      if (e.bucket in s) s[e.bucket] += Number(e.amount)
+    })
     return s
   }, [monthExpenses])
 
-  const totalLimit = BUCKETS.reduce((a, b) => a + Number(data.limits[b.id] || 0), 0)
-  const totalSpent = spent.home + spent.eshan + spent.niharika
+  // Vacation and Extras run on a yearly budget (January to December)
+  const viewYear = String(viewMonth.getFullYear())
+  const yearSpent = useMemo(() => {
+    const s = emptyTotals()
+    data.expenses.forEach((e) => {
+      if (e.date.startsWith(viewYear) && e.bucket in s) s[e.bucket] += Number(e.amount)
+    })
+    return s
+  }, [data.expenses, viewYear])
+
+  const totalLimit = MONTHLY.reduce((a, b) => a + Number(data.limits[b.id] || 0), 0)
+  const totalSpent = MONTHLY.reduce((a, b) => a + spent[b.id], 0)
 
   const daysInMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth() + 1, 0).getDate()
   const dayOfMonth = isCurrentMonth ? new Date().getDate() : daysInMonth
@@ -335,7 +352,7 @@ export default function App() {
     if (monthExpenses.length === 0) return 'sleepy'
     const usedPct = totalLimit ? totalSpent / totalLimit : 0
     const timePct = dayOfMonth / daysInMonth
-    const anyOver = BUCKETS.some((b) => spent[b.id] > data.limits[b.id])
+    const anyOver = MONTHLY.some((b) => spent[b.id] > data.limits[b.id])
     if (anyOver || usedPct > 1) return 'surprised'
     if (usedPct > timePct * 1.1) return 'curious'
     if (usedPct < timePct * 0.75) return 'joyful'
@@ -439,7 +456,7 @@ export default function App() {
       </header>
 
       <section className="buckets" aria-label="Budgets">
-        {BUCKETS.map((b) => {
+        {MONTHLY.map((b) => {
           const limit = Number(data.limits[b.id] || 0)
           const used = spent[b.id]
           const pct = limit ? Math.min(used / limit, 1) : 0
@@ -470,6 +487,43 @@ export default function App() {
               <span className={`bucket-left ${left < 0 ? 'over' : ''}`}>
                 {left >= 0 ? `${fmt(left)} left of ${fmt(limit)}` : `${fmt(-left)} over ${fmt(limit)}`}
               </span>
+            </button>
+          )
+        })}
+      </section>
+
+      <section className="buckets yearly" aria-label="Yearly budgets">
+        <h2 className="with-pic">
+          <img src={pic('explorer')} alt="" aria-hidden="true" />
+          Yearly budgets {viewYear}
+        </h2>
+        {YEARLY.map((b) => {
+          const limit = Number(data.limits[b.id] || 0)
+          const used = yearSpent[b.id]
+          const pct = limit ? Math.min(used / limit, 1) : 0
+          const left = limit - used
+          const active = filter === b.id
+          return (
+            <button
+              key={b.id}
+              className={`bucket ${active ? 'active' : ''}`}
+              style={{ '--c': b.color, '--soft': b.soft }}
+              onClick={() => setFilter(active ? 'all' : b.id)}
+              aria-pressed={active}
+            >
+              <img className="bucket-pic" src={pic(left < 0 ? 'surprised' : b.pic)} alt="" aria-hidden="true" />
+              <span className="bucket-top">
+                <span className="bucket-name">{b.label}</span>
+                <span className="bucket-hint">{b.hint}</span>
+              </span>
+              <span className="bucket-spent">{fmt(used)}</span>
+              <span className="bar">
+                <span className="bar-fill" style={{ width: `${pct * 100}%` }} />
+              </span>
+              <span className={`bucket-left ${left < 0 ? 'over' : ''}`}>
+                {left >= 0 ? `${fmt(left)} left of ${fmt(limit)} this year` : `${fmt(-left)} over ${fmt(limit)}`}
+              </span>
+              {spent[b.id] > 0 && <span className="bucket-month">{fmt(spent[b.id])} this month</span>}
             </button>
           )
         })}
@@ -599,7 +653,7 @@ function Insights({ monthExpenses, spent, limits, daysLeft, dayOfMonth, isCurren
         <div className="per-day">
           <p className="per-day-title">Safe to spend each day for the rest of the month</p>
           <div className="per-day-grid">
-            {BUCKETS.map((b) => {
+            {MONTHLY.map((b) => {
               const left = Math.max(Number(limits[b.id]) - spent[b.id], 0)
               return (
                 <div key={b.id} className="per-day-item" style={{ '--c': b.color }}>
@@ -730,12 +784,12 @@ function ExpenseSheet({ initial, defaultBucket, onSave, onDelete, onClose }) {
 function LimitsSheet({ limits, onSave, onClose }) {
   const [vals, setVals] = useState({ ...limits })
   return (
-    <Sheet title="Monthly limits" peek="signpost" onClose={onClose}>
+    <Sheet title="Budget limits" peek="signpost" onClose={onClose}>
       {BUCKETS.map((b) => (
         <label key={b.id} className="limit-row" style={{ '--c': b.color }}>
           <span className="limit-name">
             {b.label}
-            <small>{b.hint}</small>
+            <small>{b.yearly ? 'Per year' : 'Per month'}</small>
           </span>
           <span className="limit-input">
             ₹
@@ -743,7 +797,7 @@ function LimitsSheet({ limits, onSave, onClose }) {
               type="number"
               inputMode="numeric"
               min="0"
-              value={vals[b.id]}
+              value={vals[b.id] ?? ''}
               onChange={(e) => setVals({ ...vals, [b.id]: e.target.value })}
             />
           </span>
@@ -1099,6 +1153,8 @@ function Reports({ day, viewMonth, expenses, limits }) {
     home: pic('hoodie'),
     eshan: pic('beanie'),
     niharika: pic('music'),
+    vacation: pic('explorer'),
+    extra: pic('cozy'),
   }
 
   async function run(kind) {

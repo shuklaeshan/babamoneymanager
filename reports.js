@@ -327,16 +327,24 @@ async function prepare(pics) {
 export async function makeDailyReport({ day, expenses, limits, buckets, pics, note }) {
   const imgs = await prepare(pics)
   const measure = document.createElement('canvas').getContext('2d')
-  const items = expenses.filter((e) => e.date === day).sort((a, b) => a.createdAt - b.createdAt)
+  const monthly = buckets.filter((b) => !b.yearly)
+  const yearly = buckets.filter((b) => b.yearly)
+  const add = (obj, e) => {
+    if (e.bucket in obj) obj[e.bucket] += Number(e.amount)
+  }
+  const items = expenses
+    .filter((e) => e.date === day && buckets.some((b) => b.id === e.bucket))
+    .sort((a, b) => a.createdAt - b.createdAt)
   const total = items.reduce((a, e) => a + Number(e.amount), 0)
   const byBucket = Object.fromEntries(buckets.map((b) => [b.id, 0]))
-  items.forEach((e) => (byBucket[e.bucket] += Number(e.amount)))
+  items.forEach((e) => add(byBucket, e))
 
   const monthKey = day.slice(0, 7)
   const monthSpent = Object.fromEntries(buckets.map((b) => [b.id, 0]))
-  expenses
-    .filter((e) => e.date.startsWith(monthKey) && e.date <= day)
-    .forEach((e) => (monthSpent[e.bucket] += Number(e.amount)))
+  expenses.filter((e) => e.date.startsWith(monthKey) && e.date <= day).forEach((e) => add(monthSpent, e))
+  const yearSpent = Object.fromEntries(buckets.map((b) => [b.id, 0]))
+  expenses.filter((e) => e.date.startsWith(day.slice(0, 4)) && e.date <= day).forEach((e) => add(yearSpent, e))
+  const shown = buckets.filter((b) => !b.yearly || byBucket[b.id] > 0)
 
   const blocks = [
     headerBlock({ title: 'Daily report', subtitle: longDate(day), imgs }),
@@ -353,8 +361,8 @@ export async function makeDailyReport({ day, expenses, limits, buckets, pics, no
           color: C.muted,
           align: 'right',
         })
-        const colW = (INNER - 80) / buckets.length
-        buckets.forEach((b, i) => {
+        const colW = (INNER - 80) / shown.length
+        shown.forEach((b, i) => {
           const x = PAD + 40 + i * colW
           text(ctx, b.label, x, y + 210, { weight: 800, size: 30, color: b.color })
           text(ctx, fmt(byBucket[b.id]), x, y + 245, { weight: 800, size: 30 })
@@ -379,7 +387,11 @@ export async function makeDailyReport({ day, expenses, limits, buckets, pics, no
   }
 
   blocks.push(spacer(30))
-  blocks.push(bucketBars({ buckets, spent: monthSpent, limits, imgs, title: 'This month so far' }))
+  blocks.push(bucketBars({ buckets: monthly, spent: monthSpent, limits, imgs, title: 'This month so far' }))
+  if (yearly.length) {
+    blocks.push(spacer(20))
+    blocks.push(bucketBars({ buckets: yearly, spent: yearSpent, limits, imgs, title: 'This year so far' }))
+  }
   blocks.push(spacer(20))
   blocks.push(footerBlock({ note, imgs, measureCtx: measure }))
 
@@ -399,15 +411,26 @@ export async function makeMonthlyReport({ month, expenses, limits, buckets, pics
   const prevKey = `${prev.getFullYear()}-${pad2(prev.getMonth() + 1)}`
   const monthName = month.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })
 
+  const monthly = buckets.filter((b) => !b.yearly)
+  const yearly = buckets.filter((b) => b.yearly)
+  const known = (e) => buckets.some((b) => b.id === e.bucket)
   const items = expenses
-    .filter((e) => e.date.startsWith(key))
+    .filter((e) => e.date.startsWith(key) && known(e))
     .sort((a, b) => (a.date === b.date ? a.createdAt - b.createdAt : a.date < b.date ? -1 : 1))
-  const prevTotal = expenses.filter((e) => e.date.startsWith(prevKey)).reduce((a, e) => a + Number(e.amount), 0)
+  const prevTotal = expenses
+    .filter((e) => e.date.startsWith(prevKey) && buckets.some((b) => b.id === e.bucket && !b.yearly))
+    .reduce((a, e) => a + Number(e.amount), 0)
 
-  const total = items.reduce((a, e) => a + Number(e.amount), 0)
-  const totalLimit = buckets.reduce((a, b) => a + Number(limits[b.id] || 0), 0)
   const spent = Object.fromEntries(buckets.map((b) => [b.id, 0]))
   items.forEach((e) => (spent[e.bucket] += Number(e.amount)))
+  const total = monthly.reduce((a, b) => a + spent[b.id], 0)
+  const allTotal = items.reduce((a, e) => a + Number(e.amount), 0)
+  const yearlyThisMonth = allTotal - total
+  const totalLimit = monthly.reduce((a, b) => a + Number(limits[b.id] || 0), 0)
+  const yearSpent = Object.fromEntries(buckets.map((b) => [b.id, 0]))
+  expenses
+    .filter((e) => e.date.startsWith(String(y0)) && e.date.slice(0, 7) <= key && known(e))
+    .forEach((e) => (yearSpent[e.bucket] += Number(e.amount)))
 
   const daysInMonth = new Date(y0, m0 + 1, 0).getDate()
   const now = new Date()
@@ -444,7 +467,7 @@ export async function makeMonthlyReport({ month, expenses, limits, buckets, pics
   }
 
   const insights = [
-    { label: 'Daily average', value: fmt(total / Math.max(daysCounted, 1)), sub: `over ${daysCounted} days` },
+    { label: 'Daily average', value: fmt(allTotal / Math.max(daysCounted, 1)), sub: `over ${daysCounted} days` },
     {
       label: 'Biggest day',
       value: items.length ? fmt(perDay[bigDayIdx]) : fmt(0),
@@ -471,7 +494,7 @@ export async function makeMonthlyReport({ month, expenses, limits, buckets, pics
       h: 300,
       draw(ctx, y) {
         fillRR(ctx, PAD, y, INNER, 270, 40, C.paper)
-        text(ctx, 'Spent this month', PAD + 40, y + 70, { weight: 700, size: 32, color: C.muted })
+        text(ctx, 'Monthly budgets spent', PAD + 40, y + 70, { weight: 700, size: 32, color: C.muted })
         text(ctx, fmt(total), PAD + 40, y + 150, { weight: 800, size: 84 })
         text(ctx, `of ${fmt(totalLimit)}`, PAD + INNER - 40, y + 150, {
           weight: 700,
@@ -484,7 +507,7 @@ export async function makeMonthlyReport({ month, expenses, limits, buckets, pics
         fillRR(ctx, PAD + 40, y + 180, Math.max((INNER - 80) * pct, 26), 26, 13, total > totalLimit ? C.danger : C.leaf)
         text(
           ctx,
-          `${items.length} entries · ${total <= totalLimit ? `${fmt(totalLimit - total)} still free` : `${fmt(total - totalLimit)} over`}`,
+          `${items.length} entries · ${total <= totalLimit ? `${fmt(totalLimit - total)} still free` : `${fmt(total - totalLimit)} over`}${yearlyThisMonth > 0 ? ` · plus ${fmt(yearlyThisMonth)} yearly` : ''}`,
           PAD + 40,
           y + 248,
           { weight: 700, size: 30, color: C.muted }
@@ -492,7 +515,10 @@ export async function makeMonthlyReport({ month, expenses, limits, buckets, pics
       },
     },
     spacer(10),
-    bucketBars({ buckets, spent, limits, imgs, title: 'Each budget' }),
+    bucketBars({ buckets: monthly, spent, limits, imgs, title: 'Each budget' }),
+    ...(yearly.length
+      ? [spacer(20), bucketBars({ buckets: yearly, spent: yearSpent, limits, imgs, title: `Yearly budgets, ${y0} so far` })]
+      : []),
     sectionTitle('Insights'),
     {
       h: 3 * 190 + 10,
